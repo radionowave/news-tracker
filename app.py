@@ -14,11 +14,12 @@ from PIL import Image
 import schedule
 import cv2
 import os
+import pandas as pd
 
 # Налаштування Selenium WebDriver
 chrome_options = Options()
 chrome_options.add_argument("--headless")  # запуск без графічного інтерфейсу
-chrome_service = ChromeService(executable_path='/path/to/chromedriver')  # замініть на ваш шлях до chromedriver
+chrome_service = ChromeService(executable_path='/usr/local/bin/chromedriver')  # замініть на ваш шлях до chromedriver
 
 # Ініціалізація змінних
 tracked_blocks = {}
@@ -27,9 +28,17 @@ SECTION = ''
 TITLE = ''
 BLOCK_ID = ''
 SCREENSHOT_FOLDER = 'screenshots'
+CSV_FILE = 'news_metadata.csv'
 
 if not os.path.exists(SCREENSHOT_FOLDER):
     os.makedirs(SCREENSHOT_FOLDER)
+
+# Створення CSV файлу, якщо не існує
+if not os.path.exists(CSV_FILE):
+    with open(CSV_FILE, 'w', newline='', encoding='utf-8') as csvfile:
+        fieldnames = ['section', 'title', 'block_id', 'screenshot_link', 'start_date', 'end_date']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
 
 def fetch_news(url, section, title, block_id):
     response = requests.get(url)
@@ -56,6 +65,11 @@ def fetch_news(url, section, title, block_id):
     # Зробити скріншот сторінки
     driver = webdriver.Chrome(service=chrome_service, options=chrome_options)
     driver.get(url)
+
+    # Виконати JavaScript для отримання повного розміру сторінки
+    total_width = driver.execute_script("return document.body.scrollWidth")
+    total_height = driver.execute_script("return document.body.scrollHeight")
+    driver.set_window_size(total_width, total_height)
     driver.save_screenshot(current_screenshot_path)
     driver.quit()
 
@@ -82,71 +96,103 @@ def fetch_news(url, section, title, block_id):
                     'time_displaced': datetime.now().isoformat()
                 }
 
-def export_to_csv():
-    with open('news_metadata.csv', 'w', newline='', encoding='utf-8') as csvfile:
-        fieldnames = ['section', 'title', 'time_posted', 'time_displaced']
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+def export_to_csv(section, title, block_id, screenshot_link, start_date, end_date):
+    with open(CSV_FILE, 'a', newline='', encoding='utf-8') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=['section', 'title', 'block_id', 'screenshot_link', 'start_date', 'end_date'])
+        writer.writerow({
+            'section': section,
+            'title': title,
+            'block_id': block_id,
+            'screenshot_link': screenshot_link,
+            'start_date': start_date,
+            'end_date': end_date
+        })
 
-        writer.writeheader()
-        for block_id, data in tracked_blocks.items():
-            writer.writerow(data)
+def start_tracking(interval):
+    schedule.clear()  # Очистити всі заплановані завдання
 
-def start_tracking():
-    global URL, SECTION, TITLE, BLOCK_ID
-    fetch_news(URL, SECTION, TITLE, BLOCK_ID)
-    export_to_csv()
-    print("Дані експортовані у файл news_metadata.csv")
+    def job():
+        fetch_news(URL, SECTION, TITLE, BLOCK_ID)
+        screenshot_link = os.path.join(SCREENSHOT_FOLDER, f"{BLOCK_ID}.png")
+        start_date = datetime.now().isoformat()
+        end_date = (datetime.now() + pd.Timedelta(seconds=interval)).isoformat()
+        export_to_csv(SECTION, TITLE, BLOCK_ID, screenshot_link, start_date, end_date)
+        print("Дані експортовані у файл news_metadata.csv")
+
+    schedule.every(interval).seconds.do(job)
+
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+
+def stop_tracking():
+    schedule.clear()
+    return "Трекінг зупинено"
 
 def show_screenshot(url):
     driver = webdriver.Chrome(service=chrome_service, options=chrome_options)
     driver.get(url)
+
+    # Виконати JavaScript для отримання повного розміру сторінки
+    total_width = driver.execute_script("return document.body.scrollWidth")
+    total_height = driver.execute_script("return document.body.scrollHeight")
+    driver.set_window_size(total_width, total_height)
     screenshot_path = os.path.join(SCREENSHOT_FOLDER, 'temp_screenshot.png')
     driver.save_screenshot(screenshot_path)
     driver.quit()
     return screenshot_path
 
-def confirm_selection(section, title, block_id):
+def confirm_selection(uploaded_image, section, title, block_id, start_date, end_date):
     global URL, SECTION, TITLE, BLOCK_ID
     SECTION = section
     TITLE = title
     BLOCK_ID = block_id
-    screenshot_path = os.path.join(SCREENSHOT_FOLDER, 'temp_screenshot.png')
     saved_path = os.path.join(SCREENSHOT_FOLDER, f"{block_id}.png")
-    os.rename(screenshot_path, saved_path)
+    image = Image.open(uploaded_image)
+    image.save(saved_path)
+    export_to_csv(section, title, block_id, saved_path, start_date, end_date)
     return f"Виділення збережено як {saved_path}"
 
-def schedule_tracking(start_date, end_date):
-    def job():
-        start_tracking()
+def load_titles():
+    data = pd.read_csv(CSV_FILE)
+    return data['title'].unique().tolist()
 
-    schedule.every().hour.until(end_date).do(job)
-
-    while datetime.now() < end_date:
-        schedule.run_pending()
-        time.sleep(1)
+def load_parameters(title):
+    data = pd.read_csv(CSV_FILE)
+    row = data[data['title'] == title].iloc[0]
+    return row['section'], row['title'], row['block_id'], row['start_date'], row['end_date']
 
 # Візуальний інтерфейс Gradio
 with gr.Blocks() as demo:
     url_input = gr.Textbox(label="Адреса сайту")
     screenshot_output = gr.Image(label="Скріншот сторінки")
+    upload_input = gr.Image(type="filepath", label="Завантажити скріншот для виділення")
     section_input = gr.Textbox(label="Назва розділу")
+    title_dropdown = gr.Dropdown(label="Заголовок", choices=load_titles())
     title_input = gr.Textbox(label="Заголовок")
     block_id_input = gr.Textbox(label="Номерний ідентифікатор")
+    start_date_input = gr.Textbox(label="Дата початку (YYYY-MM-DD HH:MM)", value=datetime.now().strftime('%Y-%m-%d %H:%M'))
+    end_date_input = gr.Textbox(label="Дата закінчення (YYYY-MM-DD HH:MM)", value=datetime.now().strftime('%Y-%m-%d %H:%M'))
+    interval_input = gr.Number(label="Інтервал трекінгу (секунди)", value=3600)
     confirm_button = gr.Button("Підтвердити виділення")
     confirm_output = gr.Textbox(label="Статус підтвердження")
-
-    schedule_start_input = gr.Date(label="Дата початку")
-    schedule_end_input = gr.Date(label="Дата закінчення")
-    schedule_button = gr.Button("Запланувати трекінг")
-    schedule_output = gr.Textbox(label="Статус планування")
+    start_button = gr.Button("Запустити трекінг")
+    stop_button = gr.Button("Зупинити трекінг")
+    tracking_status = gr.Textbox(label="Статус трекінгу")
 
     def update_screenshot(url):
         global URL
         URL = url
         return show_screenshot(url)
 
+    def update_parameters(title):
+        section, title, block_id, start_date, end_date = load_parameters(title)
+        return section, title, block_id, start_date, end_date
+
     url_input.change(update_screenshot, inputs=url_input, outputs=screenshot_output)
-    confirm_button.click(confirm_selection, inputs=[section_input, title_input, block_id_input], outputs=confirm_output)
-    schedule_button.click(schedule_tracking, inputs=[schedule_start_input, schedule_end_input], outputs=schedule_output)
+    title_dropdown.change(update_parameters, inputs=title_dropdown, outputs=[section_input, title_input, block_id_input, start_date_input, end_date_input])
+    confirm_button.click(confirm_selection, inputs=[upload_input, section_input, title_input, block_id_input, start_date_input, end_date_input], outputs=confirm_output)
+    start_button.click(start_tracking, inputs=interval_input, outputs=tracking_status)
+    stop_button.click(stop_tracking, outputs=tracking_status)
 
 demo.launch()
