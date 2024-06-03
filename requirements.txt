@@ -1,7 +1,4 @@
+gradio
+feedparser
 requests
 beautifulsoup4
-gradio
-selenium
-pillow
-schedule
-opencv-python

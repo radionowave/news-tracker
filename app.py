@@ -1,198 +1,273 @@
-import requests
-from bs4 import BeautifulSoup
+import os
+import sqlite3
 import time
 import csv
-from datetime import datetime
+import requests
+from bs4 import BeautifulSoup
 import gradio as gr
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service as ChromeService
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.options import Options
-from PIL import Image
-import schedule
-import cv2
-import os
-import pandas as pd
 
-# Налаштування Selenium WebDriver
-chrome_options = Options()
-chrome_options.add_argument("--headless")  # запуск без графічного інтерфейсу
-chrome_service = ChromeService(executable_path='/usr/local/bin/chromedriver')  # замініть на ваш шлях до chromedriver
+# Створення та підключення до бази даних
+def initialize_db():
+    conn = sqlite3.connect('news_aggregator.db')
+    c = conn.cursor()
 
-# Ініціалізація змінних
-tracked_blocks = {}
-URL = ''
-SECTION = ''
-TITLE = ''
-BLOCK_ID = ''
-SCREENSHOT_FOLDER = 'screenshots'
-CSV_FILE = 'news_metadata.csv'
+    # Видалення існуючої таблиці monitors (якщо є)
+    c.execute('''DROP TABLE IF EXISTS monitors''')
 
-if not os.path.exists(SCREENSHOT_FOLDER):
-    os.makedirs(SCREENSHOT_FOLDER)
+    # Створення таблиці для збереження моніторингів
+    c.execute('''CREATE TABLE IF NOT EXISTS monitors (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        url TEXT NOT NULL,
+        text_fragment TEXT NOT NULL,
+        last_seen TEXT,
+        start_date TEXT NOT NULL,
+        stop_date TEXT,
+        article_id INTEGER NOT NULL UNIQUE
+    )''')
 
-# Створення CSV файлу, якщо не існує
-if not os.path.exists(CSV_FILE):
-    with open(CSV_FILE, 'w', newline='', encoding='utf-8') as csvfile:
-        fieldnames = ['section', 'title', 'block_id', 'screenshot_link', 'start_date', 'end_date']
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
+    conn.commit()
+    conn.close()
 
-def fetch_news(url, section, title, block_id):
+def check_text_fragment(url, text_fragment):
     response = requests.get(url)
-    soup = BeautifulSoup(response.content, 'html.parser')
+    if response.status_code == 200:
+        soup = BeautifulSoup(response.content, 'html.parser')
+        if text_fragment in soup.get_text():
+            return True
+    return False
 
-    # Знайти новинні блоки (змінити відповідно до структури сайту)
-    news_blocks = soup.find_all('div', class_='news-block')
+def update_last_seen(monitor_id):
+    conn = sqlite3.connect('news_aggregator.db')
+    c = conn.cursor()
+    current_time = time.strftime('%Y-%m-%d %H:%M:%S')
+    c.execute("UPDATE monitors SET last_seen = ? WHERE id = ?", (current_time, monitor_id))
+    conn.commit()
+    conn.close()
 
-    current_blocks = {}
+def update_stop_date(monitor_id):
+    conn = sqlite3.connect('news_aggregator.db')
+    c = conn.cursor()
+    stop_date = time.strftime('%Y-%m-%d %H:%M:%S')
+    c.execute("UPDATE monitors SET stop_date = ? WHERE id = ? AND stop_date IS NULL", (stop_date, monitor_id))
+    conn.commit()
+    conn.close()
 
-    for block in news_blocks:
-        block_section = block.find('div', class_='news-section').text.strip()
-        block_title = block.find('h2', class_='news-title').text.strip()
-        time_posted = block.find('time', class_='news-time')['datetime']
-
-        block_identifier = f"{block_section}:{block_title}:{time_posted}"
-
-        if block_section == section and block_title == title:
-            current_blocks[block_identifier] = True
-
-    screenshot_path = os.path.join(SCREENSHOT_FOLDER, f"{block_id}.png")
-    current_screenshot_path = os.path.join(SCREENSHOT_FOLDER, f"{block_id}_current.png")
-
-    # Зробити скріншот сторінки
-    driver = webdriver.Chrome(service=chrome_service, options=chrome_options)
-    driver.get(url)
-
-    # Виконати JavaScript для отримання повного розміру сторінки
-    total_width = driver.execute_script("return document.body.scrollWidth")
-    total_height = driver.execute_script("return document.body.scrollHeight")
-    driver.set_window_size(total_width, total_height)
-    driver.save_screenshot(current_screenshot_path)
-    driver.quit()
-
-    # Порівняти збережений скріншот з новим
-    if os.path.exists(screenshot_path):
-        img1 = cv2.imread(screenshot_path)
-        img2 = cv2.imread(current_screenshot_path)
-        if not img1 is None and not img2 is None and cv2.norm(img1, img2, cv2.NORM_L2) == 0:
-            return
+def monitor_sites():
+    conn = sqlite3.connect('news_aggregator.db')
+    c = conn.cursor()
+    c.execute("SELECT * FROM monitors")
+    monitors = c.fetchall()
+    
+    for monitor in monitors:
+        if check_text_fragment(monitor[2], monitor[3]):
+            update_last_seen(monitor[0])
         else:
-            # Оновити скріншот і зареєструвати видалення блоку
-            os.remove(screenshot_path)
-            os.rename(current_screenshot_path, screenshot_path)
-            if block_identifier in current_blocks:
-                current_blocks[block_identifier] = True
-            else:
-                current_blocks[block_identifier] = False
+            update_stop_date(monitor[0])
+    
+    conn.close()
 
-            if block_identifier not in tracked_blocks or not tracked_blocks[block_identifier]:
-                tracked_blocks[block_identifier] = {
-                    'section': section,
-                    'title': title,
-                    'time_posted': time_posted,
-                    'time_displaced': datetime.now().isoformat()
-                }
+def add_monitor(name, url, text_fragment, article_id):
+    if not url or not text_fragment or not article_id:
+        return "Жодне поле не може бути порожніми"
 
-def export_to_csv(section, title, block_id, screenshot_link, start_date, end_date):
-    with open(CSV_FILE, 'a', newline='', encoding='utf-8') as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=['section', 'title', 'block_id', 'screenshot_link', 'start_date', 'end_date'])
-        writer.writerow({
-            'section': section,
-            'title': title,
-            'block_id': block_id,
-            'screenshot_link': screenshot_link,
-            'start_date': start_date,
-            'end_date': end_date
-        })
+    if not name:
+        name = text_fragment
 
-def start_tracking(interval):
-    schedule.clear()  # Очистити всі заплановані завдання
+    conn = sqlite3.connect('news_aggregator.db')
+    c = conn.cursor()
 
-    def job():
-        fetch_news(URL, SECTION, TITLE, BLOCK_ID)
-        screenshot_link = os.path.join(SCREENSHOT_FOLDER, f"{BLOCK_ID}.png")
-        start_date = datetime.now().isoformat()
-        end_date = (datetime.now() + pd.Timedelta(seconds=interval)).isoformat()
-        export_to_csv(SECTION, TITLE, BLOCK_ID, screenshot_link, start_date, end_date)
-        print("Дані експортовані у файл news_metadata.csv")
+    c.execute("SELECT * FROM monitors WHERE text_fragment = ? AND last_seen IS NULL", (text_fragment,))
+    existing_monitor = c.fetchone()
+    
+    if existing_monitor:
+        return "Цей фрагмент вже раніше додано до моніторингу!"
 
-    schedule.every(interval).seconds.do(job)
+    c.execute("SELECT * FROM monitors WHERE article_id = ?", (article_id,))
+    existing_article_id = c.fetchone()
+    
+    if existing_article_id:
+        return "Цифровий ідентифікатор вже використовується!"
 
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
+    start_date = time.strftime('%Y-%м-%d %H:%М:%S')
+    c.execute("INSERT INTO monitors (name, url, text_fragment, start_date, article_id) VALUES (?, ?, ?, ?, ?)", (name, url, text_fragment, start_date, article_id))
+    
+    conn.commit()
+    conn.close()
+    
+    return "Моніторинг додано!"
 
-def stop_tracking():
-    schedule.clear()
-    return "Трекінг зупинено"
+def update_monitor(name, url, text_fragment, article_id):
+    if not name or not url or not text_fragment or not article_id:
+        return "Жодне поле не може бути порожніми"
 
-def show_screenshot(url):
-    driver = webdriver.Chrome(service=chrome_service, options=chrome_options)
-    driver.get(url)
+    conn = sqlite3.connect('news_aggregator.db')
+    c = conn.cursor()
 
-    # Виконати JavaScript для отримання повного розміру сторінки
-    total_width = driver.execute_script("return document.body.scrollWidth")
-    total_height = driver.execute_script("return document.body.scrollHeight")
-    driver.set_window_size(total_width, total_height)
-    screenshot_path = os.path.join(SCREENSHOT_FOLDER, 'temp_screenshot.png')
-    driver.save_screenshot(screenshot_path)
-    driver.quit()
-    return screenshot_path
+    c.execute("SELECT * FROM monitors WHERE text_fragment = ? AND last_seen IS NULL AND name != ?", (text_fragment, name))
+    existing_monitor = c.fetchone()
+    
+    if existing_monitor:
+        return "Цей фрагмент вже раніше додано до моніторингу!"
 
-def confirm_selection(uploaded_image, section, title, block_id, start_date, end_date):
-    global URL, SECTION, TITLE, BLOCK_ID
-    SECTION = section
-    TITLE = title
-    BLOCK_ID = block_id
-    saved_path = os.path.join(SCREENSHOT_FOLDER, f"{block_id}.png")
-    image = Image.open(uploaded_image)
-    image.save(saved_path)
-    export_to_csv(section, title, block_id, saved_path, start_date, end_date)
-    return f"Виділення збережено як {saved_path}"
+    c.execute("SELECT * FROM monitors WHERE article_id = ? AND name != ?", (article_id, name))
+    existing_article_id = c.fetchone()
+    
+    if existing_article_id:
+        return "Цифровий ідентифікатор вже використовується!"
 
-def load_titles():
-    data = pd.read_csv(CSV_FILE)
-    return data['title'].unique().tolist()
+    c.execute("UPDATE monitors SET url = ?, text_fragment = ?, article_id = ? WHERE name = ?", (url, text_fragment, article_id, name))
+    
+    conn.commit()
+    conn.close()
+    
+    return "Моніторинг оновлено!"
 
-def load_parameters(title):
-    data = pd.read_csv(CSV_FILE)
-    row = data[data['title'] == title].iloc[0]
-    return row['section'], row['title'], row['block_id'], row['start_date'], row['end_date']
+def get_monitors():
+    conn = sqlite3.connect('news_aggregator.db')
+    c = conn.cursor()
+    
+    c.execute("SELECT * FROM monitors")
+    monitors = c.fetchall()
+    
+    conn.close()
+    
+    return monitors
 
-# Візуальний інтерфейс Gradio
-with gr.Blocks() as demo:
-    url_input = gr.Textbox(label="Адреса сайту")
-    screenshot_output = gr.Image(label="Скріншот сторінки")
-    upload_input = gr.Image(type="filepath", label="Завантажити скріншот для виділення")
-    section_input = gr.Textbox(label="Назва розділу")
-    title_dropdown = gr.Dropdown(label="Заголовок", choices=load_titles())
-    title_input = gr.Textbox(label="Заголовок")
-    block_id_input = gr.Textbox(label="Номерний ідентифікатор")
-    start_date_input = gr.Textbox(label="Дата початку (YYYY-MM-DD HH:MM)", value=datetime.now().strftime('%Y-%m-%d %H:%M'))
-    end_date_input = gr.Textbox(label="Дата закінчення (YYYY-MM-DD HH:MM)", value=datetime.now().strftime('%Y-%m-%d %H:%M'))
-    interval_input = gr.Number(label="Інтервал трекінгу (секунди)", value=3600)
-    confirm_button = gr.Button("Підтвердити виділення")
-    confirm_output = gr.Textbox(label="Статус підтвердження")
-    start_button = gr.Button("Запустити трекінг")
-    stop_button = gr.Button("Зупинити трекінг")
-    tracking_status = gr.Textbox(label="Статус трекінгу")
+def display_monitors():
+    monitors = get_monitors()
+    html_content = "<table border='1' style='border-collapse: collapse; width: 100%;'>"
+    html_content += "<th>Текстовий фрагмент</th><th>Дата початку</th><th>Статус</th><th>Ідентифікатор статті</th></tr>"
+    for monitor in monitors:
+        if monitor[6] and monitor[6] !="Активний":
+            status = f"<span style='color:red;'>Фрагмент перестав відображатися о {monitor[6]}</span>"
+        else:
+            status = "Активний"
+        html_content += f"""
+        <tr>
+            <td>{monitor[3]}</td>
+            <td>{monitor[5]}</td>
+            <td>{status}</td>
+            <td>{monitor[7]}</td>
+        </tr>
+        """
+    html_content += "</table>"
+    return html_content
 
-    def update_screenshot(url):
-        global URL
-        URL = url
-        return show_screenshot(url)
+def get_choices():
+    monitors = get_monitors()
+    return [monitor[1] for monitor in monitors] + ["Add new..."]
 
-    def update_parameters(title):
-        section, title, block_id, start_date, end_date = load_parameters(title)
-        return section, title, block_id, start_date, end_date
+def add_or_update_monitor_interface(name, url, text_fragment, article_id):
+    monitor_names = get_choices()
+    if name in monitor_names:
+        return update_monitor(name, url, text_fragment, article_id)
+    else:
+        return add_monitor(name, url, text_fragment, article_id)
 
-    url_input.change(update_screenshot, inputs=url_input, outputs=screenshot_output)
-    title_dropdown.change(update_parameters, inputs=title_dropdown, outputs=[section_input, title_input, block_id_input, start_date_input, end_date_input])
-    confirm_button.click(confirm_selection, inputs=[upload_input, section_input, title_input, block_id_input, start_date_input, end_date_input], outputs=confirm_output)
-    start_button.click(start_tracking, inputs=interval_input, outputs=tracking_status)
-    stop_button.click(stop_tracking, outputs=tracking_status)
+def export_to_csv():
+    monitors = get_monitors()
+    with open('monitors_export.csv', 'w', newline='', encoding='utf-8') as csvfile:
+        fieldnames = ['ID', 'Name', 'URL', 'Text Fragment', 'Last Seen', 'Start Date', 'Stop Date', 'Article ID']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
 
-demo.launch()
+        writer.writeheader()
+        for monitor in monitors:
+            writer.writerow({
+                'ID': monitor[0],
+                'Name': monitor[1],
+                'URL': monitor[2],
+                'Text Fragment': monitor[3],
+                'Last Seen': monitor[4] if monitor[4] else "Немає даних",
+                'Start Date': monitor[5],
+                'Stop Date': monitor[6] if monitor[6] else "Активний",
+                'Article ID': monitor[7]
+            })
+    return "Експорт завершено!"
+
+def import_from_csv(file):
+    conn = sqlite3.connect('news_aggregator.db')
+    c = conn.cursor()
+    with open(file.name, 'r', encoding='utf-8') as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            stop_date = row.get('Stop Date', None)
+            c.execute("SELECT * FROM monitors WHERE article_id = ?", (row['Article ID'],))
+            existing_article_id = c.fetchone()
+            if existing_article_id:
+                continue
+            c.execute("INSERT INTO monitors (name, url, text_fragment, last_seen, start_date, stop_date, article_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                      (row['Name'], row['URL'], row['Text Fragment'], row['Last Seen'], row['Start Date'], stop_date, row['Article ID']))
+    conn.commit()
+    conn.close()
+    return "Імпорт завершено!"
+
+def clear_database(confirm):
+    if confirm == "Так":
+        conn = sqlite3.connect('news_aggregator.db')
+        c = conn.cursor()
+        c.execute("DELETE FROM monitors")
+        conn.commit()
+        initialize_db()  # Переконатися, що таблиця буде створена знову
+        conn.close()
+        return "База даних очищена!"
+    else:
+        return "Очищення бази даних скасовано."
+
+def delete_monitor(article_id):
+    conn = sqlite3.connect('news_aggregator.db')
+    c = conn.cursor()
+    c.execute("DELETE FROM monitors WHERE article_id = ?", (article_id,))
+    conn.commit()
+    conn.close()
+    return f"Моніторинг з ідентифікатором {article_id} видалено!"
+
+# Ініціалізація бази даних
+initialize_db()
+
+# Головний інтерфейс Gradio
+monitor_interface = gr.Interface(
+fn=display_monitors,
+inputs=[],
+outputs=gr.HTML(label="Монітори")
+)
+
+add_monitor_interface = gr.Interface(
+fn=add_or_update_monitor_interface,
+inputs=[
+gr.Dropdown(choices=get_choices(), label="Назва моніторингу"),
+gr.Textbox(label="URL"),
+gr.Textbox(label="Текстовий фрагмент"),
+gr.Number(label="Ідентифікатор статті")
+],
+outputs="text"
+)
+
+export_interface = gr.Interface(
+fn=export_to_csv,
+inputs=[],
+outputs="text"
+)
+
+import_interface = gr.Interface(
+    fn=import_from_csv,
+    inputs=[gr.File(label="Завантажте CSV файл")],
+    outputs="text"
+)
+
+clear_db_interface = gr.Interface(
+    fn=clear_database,
+    inputs=[gr.Radio(choices=["Так", "Ні"], label="Ви впевнені, що хочете очистити базу даних?")],
+    outputs="text"
+)
+
+delete_monitor_interface = gr.Interface(
+    fn=delete_monitor,
+    inputs=[gr.Number(label="Ідентифікатор статті для видалення")],
+    outputs="text"
+)
+
+gr.TabbedInterface(
+[monitor_interface, add_monitor_interface, export_interface, import_interface, clear_db_interface, delete_monitor_interface],
+["Монітори", "Додати/Оновити монітор", "Експорт даних", "Імпорт даних", "Очистити базу даних", "Видалити монітор"]
+).launch(share=True)
