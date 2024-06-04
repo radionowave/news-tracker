@@ -89,7 +89,7 @@ def add_monitor(name, url, text_fragment, article_id):
     if existing_article_id:
         return "Цифровий ідентифікатор вже використовується!"
 
-    start_date = time.strftime('%Y-%м-%d %H:%М:%S')
+    start_date = time.strftime('%Y-%m-%d %H:%M:%S')
     c.execute("INSERT INTO monitors (name, url, text_fragment, start_date, article_id) VALUES (?, ?, ?, ?, ?)", (name, url, text_fragment, start_date, article_id))
     
     conn.commit()
@@ -267,7 +267,45 @@ delete_monitor_interface = gr.Interface(
     outputs="text"
 )
 
+import threading
+
+# Функція для автоматичного оновлення моніторингу
+def auto_update_monitors(interval):
+    while auto_update_flag:
+        monitor_sites()
+        time.sleep(interval * 60)
+
+# Глобальна змінна для контролю автоматичного оновлення
+auto_update_flag = False
+
+def start_auto_update(interval):
+    global auto_update_flag
+    auto_update_flag = True
+    threading.Thread(target=auto_update_monitors, args=(interval,), daemon=True).start()
+    return "Автоматичне оновлення розпочато!"
+
+def stop_auto_update():
+    global auto_update_flag
+    auto_update_flag = False
+    return "Автоматичне оновлення зупинено!"
+
+def toggle_auto_update(auto_update, interval):
+    if auto_update:
+        return start_auto_update(interval)
+    else:
+        return stop_auto_update()
+
+# Інтерфейс для автоматичного оновлення моніторингу
+auto_update_interface = gr.Interface(
+    fn=toggle_auto_update,
+    inputs=[
+        gr.Checkbox(label="Оновлювати автоматично кожні..."),
+        gr.Number(label="Інтервал оновлень (хвилин)", value=5)
+    ],
+    outputs="text"
+)
+
 gr.TabbedInterface(
-[monitor_interface, add_monitor_interface, export_interface, import_interface, clear_db_interface, delete_monitor_interface],
-["Монітори", "Додати/Оновити монітор", "Експорт даних", "Імпорт даних", "Очистити базу даних", "Видалити монітор"]
+    [monitor_interface, add_monitor_interface, export_interface, import_interface, clear_db_interface, delete_monitor_interface, auto_update_interface], 
+    ["Монітори", "Додати/Оновити монітор", "Експорт даних", "Імпорт даних", "Очистити базу даних", "Видалити монітор", "Автоматичне оновлення"]
 ).launch(share=True)
